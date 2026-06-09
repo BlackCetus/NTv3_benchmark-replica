@@ -1,0 +1,73 @@
+settings:
+  data_cache_dir: /e/project1/crescendo/reim1/ntv3_data
+  species_token_budgets_file: /e/project1/crescendo/reim1/ntv3_benchmark/configs/species_token_budgets.yaml
+  epochs: 10
+  window_size: 1024
+  training_fraction: 0.001
+  validation_fraction: 0.001
+  batch_size: 4
+  
+models_to_test:
+  - name: BiFlash
+    type: biflash
+    checkpoint: /e/project1/crescendo/reim1/ntv3_benchmark/checkpoints/biflash_exonflex-284642.ckpt
+    hidden_dim: 512
+  - name: BiFlash_NorMuon
+    type: biflash
+    checkpoint: /e/project1/crescendo/reim1/ntv3_benchmark/checkpoints/biflash_exonflex_normuon-284643.ckpt
+    hidden_dim: 512
+  - name: ModernBERT_Pure
+    type: modernbert_pure
+    checkpoint: /e/project1/crescendo/reim1/ntv3_benchmark/checkpoints/modernbert_pure_exonflex-312813.ckpt
+    hidden_dim: 512
+  - name: SpeciesLM
+    type: bert
+    checkpoint: /e/project1/crescendo/reim1/ntv3_benchmark/checkpoints/specieslm_exonflex-281366.ckpt
+    hidden_dim: 512
+  - name: SpeciesLM_NorMuon
+    type: bert
+    checkpoint: /e/project1/crescendo/reim1/ntv3_benchmark/checkpoints/specieslm_exonflex_normuon-281363.ckpt
+    hidden_dim: 512
+  - name: SpeciesLM_Dion2
+    type: bert
+    checkpoint: /e/project1/crescendo/reim1/ntv3_benchmark/checkpoints/specieslm_exonflex_dion2-282427.ckpt
+    hidden_dim: 512
+
+tasks:
+  Regression_all:
+    type: regression
+    species: human
+    bigwig_ids:
+    force_recompute: false
+
+  # Classification_all:
+  #   type: classification
+  #   species: human
+  #   #bed_ids:
+  #   keep_target_center_fraction: 0.375
+
+  Exon:
+    type: classification
+    species: human
+    bed_ids: [exon]
+    keep_target_center_fraction: 0.375
+
+  Intron:
+    type: classification
+    species: human
+    bed_ids: [intron]
+    keep_target_center_fraction: 0.375
+
+  Splice_acceptor:
+    type: classification
+    species: human
+    bed_ids: [splice_acceptor]
+    keep_target_center_fraction: 0.375
+
+  Start_codon:
+    type: classification
+    species: human
+    bed_ids: [start_codon]
+    keep_target_center_fraction: 0.375
+
+# ~/.local/bin/uv run python /e/project1/crescendo/reim1/ntv3_benchmark/run_benchmark.py

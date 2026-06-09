@@ -1,0 +1,21 @@
+human:
+  train: 20900000000
+  val: 1050000000
+chicken:
+  train: 9470000000
+  val: 473640000
+cattle:
+  train: 26400000000
+  val: 1320000000
+arabidopsis:
+  train: 1060000000
+  val: 53010000
+maize:
+  train: 20100000000
+  val: 1010000000
+rice:
+  train: 3330000000
+  val: 166610000
+tomato:
+  train: 8000000000
+  val: 399900000
