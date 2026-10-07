@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import Any, Dict, Tuple
 
 import torch
+import torch.profiler
 import torch.distributed as dist
 
 from src.utils.logging_utils import get_benchmark_logger
+from src.utils.step_timing import StepTimer
 
 
 _LOGGER = get_benchmark_logger()
@@ -242,8 +245,21 @@ def train_one_epoch(
     task_type: str,
     epoch: int,
     epoch_fraction: float = 1.0,
+    enable_profiler: bool = False,
+    profiler_output_dir: str = "./log/profiler",
+    enable_step_timing: bool = False,
 ) -> Dict[str, float]:
-    """Train one epoch with DDP-aware sampler epoch setting and metric tracking."""
+    """Train one epoch with DDP-aware sampler epoch setting and metric tracking.
+
+    When ``enable_profiler`` is True the batch loop is wrapped in a
+    ``torch.profiler.profile`` context that writes TensorBoard traces to
+    ``profiler_output_dir``; otherwise no profiling overhead is incurred.
+
+    When ``enable_step_timing`` is True a per-phase wall-clock breakdown
+    (data_fetch / to_device / forward{backbone,head} / loss /
+    backward{backbone,head} / optimizer / metrics) is logged per epoch via a
+    ``StepTimer``; otherwise it is a no-op.
+    """
     _maybe_set_epoch(dataloader, epoch)
 
     model.train()
@@ -262,59 +278,90 @@ def train_one_epoch(
     num_batches = 0
     max_batches = _max_batches_from_fraction(dataloader, epoch_fraction)
 
-    for batch_idx, batch in enumerate(dataloader):
-        if max_batches is not None and batch_idx >= max_batches:
-            break
-        tokens = _extract_tokens(batch).to(device, non_blocking=True)
-        targets = _extract_targets(batch).to(device, non_blocking=True)
-
-        outputs = _forward_model(model, tokens)
-        outputs = outputs.float()
-        if task_type.strip().lower() == "regression":
-            outputs, targets = _align_regression_tensors(outputs, targets)
-        outputs_flat, targets_flat = _flatten_for_task(outputs, targets, task_type)
-
-        if task_type.strip().lower() == "regression":
-            loss = loss_fn(outputs, targets)
-        else:
-            loss = loss_fn(outputs_flat, targets_flat)
-
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-
-        outputs_tracked = outputs_flat.detach()
-        targets_tracked = targets_flat.detach()
-
-        metrics_tracker.update(
-            outputs_tracked,
-            targets_tracked,
-            loss=loss.item(), 
+    if enable_profiler:
+        profiler_ctx: Any = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(profiler_output_dir),
+            record_shapes=True,
+            with_stack=True,
         )
+    else:
+        profiler_ctx = contextlib.nullcontext()
 
-        running_loss += loss.item()
-        num_batches += 1
+    step_timer = StepTimer(model, enabled=enable_step_timing, device=device)
+    try:
+        with profiler_ctx as prof:
+            step_timer.begin_epoch()
+            for batch_idx, batch in enumerate(dataloader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+                step_timer.data_fetch_boundary()
 
-        # Log peak memory after the first batch to capture the initial allocation pattern
-        if (
-            torch.cuda.is_available()
-            and not first_batch_logged
-            and _is_main_process()
-        ):
-            try:
-                torch.cuda.synchronize()
-                peak_reserved = torch.cuda.max_memory_reserved() / 1024**2
-                alloc = torch.cuda.memory_allocated() / 1024**2
-                reserved = torch.cuda.memory_reserved() / 1024**2
-                _LOGGER.info("[Mem][FirstBatch]")
-                _LOGGER.info(f"  Allocated:     {alloc:.0f} MiB")
-                _LOGGER.info(f"  Reserved:      {reserved:.0f} MiB")
-                _LOGGER.info(f"  Peak Reserved: {peak_reserved:.0f} MiB")
-                first_batch_logged = True
-                setattr(model, "_first_batch_memory_logged", True)
-                torch.cuda.reset_peak_memory_stats()
-            except Exception:
-                pass
+                with step_timer.phase("to_device"):
+                    tokens = _extract_tokens(batch).to(device, non_blocking=True)
+                    targets = _extract_targets(batch).to(device, non_blocking=True)
+
+                with step_timer.phase("forward"):
+                    outputs = _forward_model(model, tokens)
+                    outputs = outputs.float()
+                    if task_type.strip().lower() == "regression":
+                        outputs, targets = _align_regression_tensors(outputs, targets)
+                    outputs_flat, targets_flat = _flatten_for_task(outputs, targets, task_type)
+
+                with step_timer.phase("loss"):
+                    if task_type.strip().lower() == "regression":
+                        loss = loss_fn(outputs, targets)
+                    else:
+                        loss = loss_fn(outputs_flat, targets_flat)
+
+                with step_timer.phase("backward"):
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+
+                with step_timer.phase("optimizer"):
+                    optimizer.step()
+
+                if prof is not None:
+                    prof.step()  # Step the profiler to record this iteration
+
+                with step_timer.phase("metrics"):
+                    outputs_tracked = outputs_flat.detach()
+                    targets_tracked = targets_flat.detach()
+                    metrics_tracker.update(
+                        outputs_tracked,
+                        targets_tracked,
+                        loss=loss.item(),
+                    )
+                    running_loss += loss.item()
+
+                num_batches += 1
+                step_timer.end_iter()
+
+                # Log peak memory after the first batch to capture the initial allocation pattern
+                if (
+                    torch.cuda.is_available()
+                    and not first_batch_logged
+                    and _is_main_process()
+                ):
+                    try:
+                        torch.cuda.synchronize()
+                        peak_reserved = torch.cuda.max_memory_reserved() / 1024**2
+                        alloc = torch.cuda.memory_allocated() / 1024**2
+                        reserved = torch.cuda.memory_reserved() / 1024**2
+                        _LOGGER.info("[Mem][FirstBatch]")
+                        _LOGGER.info(f"  Allocated:     {alloc:.0f} MiB")
+                        _LOGGER.info(f"  Reserved:      {reserved:.0f} MiB")
+                        _LOGGER.info(f"  Peak Reserved: {peak_reserved:.0f} MiB")
+                        first_batch_logged = True
+                        setattr(model, "_first_batch_memory_logged", True)
+                        torch.cuda.reset_peak_memory_stats()
+                    except Exception:
+                        pass
+    finally:
+        step_timer.remove()
+
+    step_timer.log_epoch(epoch)
 
     # Aggregate metrics across all ranks for DDP
     if _is_distributed():

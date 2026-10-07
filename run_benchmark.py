@@ -38,6 +38,7 @@ from src.utils.report_formatting import (
     print_run_banner,
     print_status_block,
 )
+from src.utils.timing_utils import TimingRecorder
 
 
 _LOGGER = get_benchmark_logger()
@@ -179,6 +180,9 @@ def main(
 
     local_rank, rank, world_size, device = _init_ddp()
 
+    timing = TimingRecorder()
+    timing_csv_path: Path | None = None
+
     try:
         if config_path is None:
             config_path = Path(__file__).resolve().parent / "configs" / "core_10_tasks.yaml"
@@ -235,6 +239,11 @@ def main(
         epochs = settings_cfg.get("epochs", 10)
         default_training_fraction = float(settings_cfg.get("training_fraction", 1.0))
         default_validation_fraction = float(settings_cfg.get("validation_fraction", default_training_fraction))
+        enable_torch_profiler = bool(settings_cfg.get("enable_torch_profiler", False))
+        profiler_output_dir = str(settings_cfg.get("profiler_output_dir", "./log/profiler"))
+        enable_step_timing = bool(settings_cfg.get("enable_step_timing", False))
+
+        timing_csv_path = results_root / "timing_report.csv"
 
         for model_cfg in models_cfg:
             model_name = _sanitize_dir_name(str(model_cfg["name"]))
@@ -252,7 +261,7 @@ def main(
                 window_size = int(task_cfg.get("window_size", model_window_size))
 
                 batch_size = model_batch_size
-                num_workers = int(task_cfg.get("num_workers", 0))
+                num_workers = int(model_cfg.get("num_workers", settings_cfg.get("num_workers", 0)))
                 train_num_samples = int(task_cfg.get("train_num_samples", 256))
                 eval_num_samples = int(task_cfg.get("eval_num_samples", 128))
                 learning_rate = float(task_cfg.get("learning_rate", 1e-05))
@@ -341,21 +350,22 @@ def main(
                                 _LOGGER.info(f"  Previous Score: {score:.6f}")
                             # Also generate plots for this existing run (if possible)
                             try:
-                                # Prepare minimal genomics inputs to obtain track names and metadata
-                                genomics_inputs = prepare_genomics_inputs(
-                                    species=species,
-                                    bigwig_file_ids=bigwig_ids,
-                                    bed_file_ids=bed_ids,
-                                    data_cache_dir=global_cache_dir,
-                                )
-                                num_tracks = genomics_inputs.num_tracks_for_task(task_type)
-                                if task_type == "regression":
-                                    track_names = genomics_inputs.bigwig_ids
-                                else:
-                                    track_names = genomics_inputs.bed_ids
-                                if not track_names:
-                                    track_names = [f"track_{i}" for i in range(num_tracks)]
-                                _generate_run_plots(run_dir, task_type, track_names, genomics_inputs.metadata_df)
+                                with timing.timed(model=model_cfg["name"], task=task_name, step="skipped_replot"):
+                                    # Prepare minimal genomics inputs to obtain track names and metadata
+                                    genomics_inputs = prepare_genomics_inputs(
+                                        species=species,
+                                        bigwig_file_ids=bigwig_ids,
+                                        bed_file_ids=bed_ids,
+                                        data_cache_dir=global_cache_dir,
+                                    )
+                                    num_tracks = genomics_inputs.num_tracks_for_task(task_type)
+                                    if task_type == "regression":
+                                        track_names = genomics_inputs.bigwig_ids
+                                    else:
+                                        track_names = genomics_inputs.bed_ids
+                                    if not track_names:
+                                        track_names = [f"track_{i}" for i in range(num_tracks)]
+                                    _generate_run_plots(run_dir, task_type, track_names, genomics_inputs.metadata_df)
                             except Exception:
                                 pass
                     if dist.is_available() and dist.is_initialized():
@@ -373,25 +383,29 @@ def main(
                 
                 run_dir.mkdir(parents=True, exist_ok=True)
 
-                genomics_inputs = prepare_genomics_inputs(
-                    species=species,
-                    bigwig_file_ids=bigwig_ids,
-                    bed_file_ids=bed_ids,
-                    data_cache_dir=global_cache_dir,
-                )
+                run_model_name = model_cfg["name"]
+
+                with timing.timed(model=run_model_name, task=task_name, step="data_prep"):
+                    genomics_inputs = prepare_genomics_inputs(
+                        species=species,
+                        bigwig_file_ids=bigwig_ids,
+                        bed_file_ids=bed_ids,
+                        data_cache_dir=global_cache_dir,
+                    )
 
                 # Compute task-appropriate number of tracks from genomics inputs
                 num_tracks = genomics_inputs.num_tracks_for_task(task_type)
 
-                model = _build_model(model_cfg, task_type, num_tracks, keep_target_center_fraction, device=device)
-                model = model.to(device)
-                if dist.is_initialized():
-                    # For CUDA devices, pass the local device index; for CPU leave device_ids unset
-                    if device.type == "cuda":
-                        dev_idx = device.index if device.index is not None else 0
-                        model = DDP(model, device_ids=[dev_idx], output_device=dev_idx, find_unused_parameters=True)
-                    else:
-                        model = DDP(model, find_unused_parameters=True)
+                with timing.timed(model=run_model_name, task=task_name, step="model_build"):
+                    model = _build_model(model_cfg, task_type, num_tracks, keep_target_center_fraction, device=device)
+                    model = model.to(device)
+                    if dist.is_initialized():
+                        # For CUDA devices, pass the local device index; for CPU leave device_ids unset
+                        if device.type == "cuda":
+                            dev_idx = device.index if device.index is not None else 0
+                            model = DDP(model, device_ids=[dev_idx], output_device=dev_idx, find_unused_parameters=model_cfg.get("find_unused_parameters", False))
+                        else:
+                            model = DDP(model, find_unused_parameters=model_cfg.get("find_unused_parameters", False))
 
                 tokenizer = getattr(model, "tokenizer", None)
                 if tokenizer is None and hasattr(model, "module"):
@@ -406,68 +420,69 @@ def main(
                 else:
                     transform_fn = lambda x: x
 
-                train_dataset, _ = create_dataset_and_loader(
-                    fasta_path=genomics_inputs.fasta_path,
-                    bigwig_path_list=genomics_inputs.bigwig_paths,
-                    chrom_regions=genomics_inputs.splits_df,
-                    split="train",
-                    tokenizer=tokenizer,
-                    transform_fn=transform_fn,
-                    num_samples=train_num_samples,
-                    batch_size=batch_size,
-                    num_workers=num_workers,
-                    target_center_col=target_column,
-                    shuffle=False,
-                    task_type=task_type,
-                    bed_path_list=genomics_inputs.bed_paths,
-                    bigwig_ids=genomics_inputs.bigwig_ids,
-                    bed_ids=genomics_inputs.bed_ids,
-                    metadata_df=genomics_inputs.metadata_df,
-                    keep_target_center_fraction=keep_target_center_fraction,
-                    window_size=window_size,
-                    seed=seed,
-                )
-                eval_split = _find_eval_split(genomics_inputs.splits_df)
-                eval_dataset, _ = create_dataset_and_loader(
-                    fasta_path=genomics_inputs.fasta_path,
-                    bigwig_path_list=genomics_inputs.bigwig_paths,
-                    chrom_regions=genomics_inputs.splits_df,
-                    split=eval_split,
-                    tokenizer=tokenizer,
-                    transform_fn=transform_fn,
-                    num_samples=eval_num_samples,
-                    batch_size=batch_size,
-                    num_workers=num_workers,
-                    target_center_col=target_column,
-                    shuffle=False,
-                    task_type=task_type,
-                    bed_path_list=genomics_inputs.bed_paths,
-                    bigwig_ids=genomics_inputs.bigwig_ids,
-                    bed_ids=genomics_inputs.bed_ids,
-                    metadata_df=genomics_inputs.metadata_df,
-                    keep_target_center_fraction=keep_target_center_fraction,
-                    window_size=window_size,
-                    seed=seed,
-                )
+                with timing.timed(model=run_model_name, task=task_name, step="dataset_loader_build"):
+                    train_dataset, _ = create_dataset_and_loader(
+                        fasta_path=genomics_inputs.fasta_path,
+                        bigwig_path_list=genomics_inputs.bigwig_paths,
+                        chrom_regions=genomics_inputs.splits_df,
+                        split="train",
+                        tokenizer=tokenizer,
+                        transform_fn=transform_fn,
+                        num_samples=train_num_samples,
+                        batch_size=batch_size,
+                        num_workers=num_workers,
+                        target_center_col=target_column,
+                        shuffle=False,
+                        task_type=task_type,
+                        bed_path_list=genomics_inputs.bed_paths,
+                        bigwig_ids=genomics_inputs.bigwig_ids,
+                        bed_ids=genomics_inputs.bed_ids,
+                        metadata_df=genomics_inputs.metadata_df,
+                        keep_target_center_fraction=keep_target_center_fraction,
+                        window_size=window_size,
+                        seed=seed,
+                    )
+                    eval_split = _find_eval_split(genomics_inputs.splits_df)
+                    eval_dataset, _ = create_dataset_and_loader(
+                        fasta_path=genomics_inputs.fasta_path,
+                        bigwig_path_list=genomics_inputs.bigwig_paths,
+                        chrom_regions=genomics_inputs.splits_df,
+                        split=eval_split,
+                        tokenizer=tokenizer,
+                        transform_fn=transform_fn,
+                        num_samples=eval_num_samples,
+                        batch_size=batch_size,
+                        num_workers=num_workers,
+                        target_center_col=target_column,
+                        shuffle=False,
+                        task_type=task_type,
+                        bed_path_list=genomics_inputs.bed_paths,
+                        bigwig_ids=genomics_inputs.bigwig_ids,
+                        bed_ids=genomics_inputs.bed_ids,
+                        metadata_df=genomics_inputs.metadata_df,
+                        keep_target_center_fraction=keep_target_center_fraction,
+                        window_size=window_size,
+                        seed=seed,
+                    )
 
-                train_loader = _build_loader_with_distributed_sampler(
-                    dataset=train_dataset,
-                    batch_size=batch_size,
-                    num_workers=num_workers,
-                    rank=rank,
-                    world_size=world_size,
-                    shuffle=False,
-                    seed=seed,
-                )
-                eval_loader = _build_loader_with_distributed_sampler(
-                    dataset=eval_dataset,
-                    batch_size=batch_size,
-                    num_workers=num_workers,
-                    rank=rank,
-                    world_size=world_size,
-                    shuffle=False,
-                    seed=seed,
-                )
+                    train_loader = _build_loader_with_distributed_sampler(
+                        dataset=train_dataset,
+                        batch_size=batch_size,
+                        num_workers=num_workers,
+                        rank=rank,
+                        world_size=world_size,
+                        shuffle=False,
+                        seed=seed,
+                    )
+                    eval_loader = _build_loader_with_distributed_sampler(
+                        dataset=eval_dataset,
+                        batch_size=batch_size,
+                        num_workers=num_workers,
+                        rank=rank,
+                        world_size=world_size,
+                        shuffle=False,
+                        seed=seed,
+                    )
 
                 if overfit_debug:
                     debug_batch = _snapshot_first_batch(train_loader)
@@ -513,27 +528,32 @@ def main(
                 epoch_history: list[dict[str, float]] = []
                 eval_metrics: dict[str, float] = {}
                 for epoch in range(epochs):
-                    train_one_epoch(
-                        model=model,
-                        dataloader=train_loader,
-                        loss_fn=loss_fn,
-                        metrics_tracker=metrics_tracker,
-                        optimizer=optimizer,
-                        device=device,
-                        task_type=task_type,
-                        epoch=epoch,
-                        epoch_fraction=training_fraction,
-                    )
-                    eval_metrics = evaluate(
-                        model=model,
-                        dataloader=eval_loader,
-                        loss_fn=loss_fn,
-                        metrics_tracker=metrics_tracker,
-                        optimizer=optimizer,
-                        device=device,
-                        task_type=task_type,
-                        epoch_fraction=validation_fraction,
-                    )
+                    with timing.timed(model=run_model_name, task=task_name, step="train_epoch"):
+                        train_one_epoch(
+                            model=model,
+                            dataloader=train_loader,
+                            loss_fn=loss_fn,
+                            metrics_tracker=metrics_tracker,
+                            optimizer=optimizer,
+                            device=device,
+                            task_type=task_type,
+                            epoch=epoch,
+                            epoch_fraction=training_fraction,
+                            enable_profiler=enable_torch_profiler,
+                            profiler_output_dir=profiler_output_dir,
+                            enable_step_timing=enable_step_timing,
+                        )
+                    with timing.timed(model=run_model_name, task=task_name, step="eval_epoch"):
+                        eval_metrics = evaluate(
+                            model=model,
+                            dataloader=eval_loader,
+                            loss_fn=loss_fn,
+                            metrics_tracker=metrics_tracker,
+                            optimizer=optimizer,
+                            device=device,
+                            task_type=task_type,
+                            epoch_fraction=validation_fraction,
+                        )
 
                     epoch_history.append({"epoch": float(epoch), **eval_metrics})
 
@@ -559,6 +579,8 @@ def main(
                     # Mark this specific config combination as computed in the cache
                     if not overfit_debug:
                         _mark_combination_computed(cache_file, model_name, task_name, config_hash, run_dir)
+                    # Persist timings incrementally so partial results survive a crash/kill.
+                    timing.save_csv(timing_csv_path)
 
                 if dist.is_available() and dist.is_initialized():
                     dist.barrier()
@@ -566,11 +588,21 @@ def main(
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
         if _is_main_process():
-            _generate_comparative_plots(results_root, tasks_cfg, models_cfg)
+            with timing.timed(model="ALL", task="ALL", step="comparative_plots"):
+                _generate_comparative_plots(results_root, tasks_cfg, models_cfg)
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
     finally:
+        # Emit timings even if the run crashed, OOMed, or hit the SLURM time
+        # limit mid-way — the partial report is often the most useful one.
+        if _is_main_process():
+            try:
+                if timing_csv_path is not None:
+                    timing.save_csv(timing_csv_path)
+                timing.print_summary()
+            except Exception:
+                pass
         if dist.is_available() and dist.is_initialized():
             dist.destroy_process_group()
 

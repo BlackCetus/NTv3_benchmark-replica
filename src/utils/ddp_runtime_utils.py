@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import random
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
@@ -31,6 +33,7 @@ def _init_ddp() -> tuple[int, int, int, torch.device]:
     if world_size > 1:
         if cuda_available:
             num_gpus = torch.cuda.device_count()
+            _LOGGER.info(f"Distributed run with WORLD_SIZE={world_size}, RANK={rank}, LOCAL_RANK={local_rank}, using {num_gpus} GPUs.")
             if num_gpus == 0:
                 raise RuntimeError("WORLD_SIZE>1 but no CUDA devices found for NCCL backend.")
             device_index = int(local_rank) % num_gpus
@@ -103,16 +106,25 @@ def _build_loader_with_distributed_sampler(
         np.random.seed(worker_seed)
         random.seed(worker_seed)
 
-    return DataLoader(
-        dataset,
+    loader_kwargs = dict(
         batch_size=batch_size,
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
         worker_init_fn=seed_worker,
-        generator=g,        
+        generator=g,
     )
+    # persistent_workers / prefetch_factor are only valid with worker processes.
+    if num_workers > 0:
+        # Keep workers alive across epochs so they aren't respawned (and the
+        # prefetch buffer refilled from cold) at the start of every epoch.
+        loader_kwargs["persistent_workers"] = True
+        # Each worker buffers this many batches ahead of the GPU, smoothing over
+        # per-batch I/O jitter (default is 2).
+        loader_kwargs["prefetch_factor"] = 4
+
+    return DataLoader(dataset, **loader_kwargs)
 
 
 def _log_gpu_memory(label: str, device: torch.device) -> dict[str, float]:

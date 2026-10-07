@@ -6,6 +6,17 @@ settings:
   training_fraction: 0.1
   validation_fraction: 0.1
   seed: 42
+  num_workers: 8
+
+  # Set true to wrap the train batch loop in torch.profiler (TensorBoard traces
+  # written to profiler_output_dir). Adds overhead — leave off for timing runs.
+  enable_torch_profiler: false
+  profiler_output_dir: ./log/profiler
+  # Set true to log a per-phase wall-clock breakdown of each train epoch
+  # (data_fetch / to_device / forward{backbone,head} / loss /
+  # backward{backbone,head} / optimizer / metrics). Adds a small uniform sync
+  # overhead per phase — enable for a diagnostic run, not full benchmarks.
+  enable_step_timing: true
 
 models_to_test:
     - name: InstaDeepAI/NTv3_100M_pre
@@ -13,7 +24,9 @@ models_to_test:
       checkpoint: InstaDeepAI/NTv3_100M_pre
       hidden_dim: 768
       window_size: 32768
-      batch_size: 16
+      batch_size: 64
+      freeze_backbone: true
+      find_unused_parameters: false
 
 tasks:
   Regression_all:

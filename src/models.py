@@ -53,6 +53,14 @@ except ImportError:
     FixedSpeciesVocab = None  # type: ignore
 
 
+def freeze_module(module: nn.Module) -> None:
+    for param in module.parameters():
+        param.requires_grad = False
+        
+    module.eval()
+    _LOGGER.info("Module frozen: all parameters set to requires_grad=False and module set to eval mode.")
+    
+
 class RegressionHead(nn.Module):
     def __init__(self, hidden_dim: int, num_tracks: int):
         super().__init__()
@@ -157,11 +165,6 @@ class BenchmarkModelBase(nn.Module, ABC):
             raise TypeError("Backbone tuple/list output does not contain a tensor hidden state.")
 
         raise TypeError(f"Unsupported backbone output type: {type(backbone_output)}")
-
-    @staticmethod
-    def _freeze_module(module: nn.Module) -> None:
-        for param in module.parameters():
-            param.requires_grad = False
 
     @abstractmethod
     def forward(self, *args: Any, **kwargs: Any) -> Any:
@@ -536,8 +539,7 @@ def _build_genome_backbone(
         inferred_dim = hidden_dim
     
     if freeze_backbone:
-        for param in backbone.parameters():
-            param.requires_grad = False
+        freeze_module(backbone)
     
     return backbone, inferred_dim, None
 
@@ -577,8 +579,7 @@ def _build_hf_backbone(
         backbone = torch.compile(backbone)
 
     if freeze_backbone:
-        for param in backbone.parameters():
-            param.requires_grad = False
+        freeze_module(backbone)
 
     hidden_dim = _infer_hf_hidden_dim(config)
     return backbone, hidden_dim, tokenizer

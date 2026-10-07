@@ -5,7 +5,7 @@
 #SBATCH --partition=booster
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:4          
 #SBATCH --time=0-12:00:00
 #SBATCH --chdir=/e/project1/crescendo/reim1/genome-lm
@@ -25,7 +25,11 @@ mkdir -p "$UV_CACHE_DIR" "$TRITON_HOME"
 cd /e/project1/crescendo/reim1/genome-lm
 source .venv/bin/activate
 
+echo Starting benchmark run at $(date)
+
 torchrun --standalone --nproc_per_node=4 \
   /e/project1/crescendo/reim1/ntv3_benchmark/run_benchmark.py \
-  --config /e/project1/crescendo/reim1/ntv3_benchmark/configs/nvt3_model_test.yaml \
+  --config /e/project1/crescendo/reim1/ntv3_benchmark/configs/ntv3_model_test.yaml \
   2> slurm/log/ntv3-benchmark-${SLURM_JOB_ID}.err
+
+echo Finished benchmark run at $(date)
